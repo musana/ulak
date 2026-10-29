@@ -45,6 +45,16 @@ Covered through the proxy environment variables that `ulak` sets:
 - botocore and boto3, Google API clients
 - any child process started with subprocess, such as curl or wget
 
+Covered only when you opt in with `raw_sockets=True`:
+
+- scripts that speak HTTP over a raw asyncio socket, using their own protocol and a sans-IO parser such as h11, with no HTTP library in between. `ulak` hooks asyncio's low level `create_connection` and tunnels each connection through the proxy with an HTTP CONNECT. It is off by default because it reroutes every asyncio TCP connection in the process, which would also catch non HTTP traffic such as async database drivers.
+
+```python
+ulak.proxy("127.0.0.1", 8080, raw_sockets=True)
+```
+
+You do not have to guess when you need this. Even with `raw_sockets` off, `ulak` watches asyncio connections, and if it sees a direct HTTP or HTTPS connection slipping past the proxy it prints a one time warning telling you to re-run with `raw_sockets=True`. So the safe default stays on, and the tool tells you when to turn the option on.
+
 ## How to use
 
 ```python
@@ -76,7 +86,9 @@ A proxy like Burp breaks into TLS with its own certificate authority, which your
 
 ## Limits
 
-`ulak` works at the library level, so it cannot catch traffic that skips those libraries, such as raw socket clients or libraries that carry their own TLS stack in C. When you call `ulak.off()`, every change is reverted and the environment is restored to how it was.
+`ulak` works at the library level, so by default it cannot catch traffic that skips those libraries, such as libraries that carry their own TLS stack in C. For raw asyncio sockets there is the `raw_sockets=True` option described above. When you call `ulak.off()`, every change is reverted and the environment is restored to how it was.
+
+One honest note on the startup banner. It lists the HTTP libraries that are installed in the process and got hooked, not the ones your specific script actually uses. If your script talks over raw sockets and uses none of those libraries, the banner can still list several of them because they happen to be installed. In that case the traffic is not proxied unless you turn on `raw_sockets=True`, and the live detector described above will point that out when it happens.
 
 ## License
 

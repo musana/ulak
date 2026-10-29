@@ -55,7 +55,7 @@ import warnings
 from typing import Callable, Dict, List, Union
 
 __all__ = ["proxy", "off", "proxied", "status", "is_active"]
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 Verify = Union[bool, str]
 
@@ -83,6 +83,7 @@ _ORIG: Dict[str, object] = {}
 _SAVED_ENV: Dict[str, Union[str, None]] = {}
 
 _VERBOSE = True
+_RAW_SOCKETS = False  # whether to hook asyncio's low-level create_connection
 
 
 def _banner(msg: str) -> None:
@@ -409,7 +410,122 @@ def _patch_tornado() -> bool:
     return True
 
 
-# (name, patcher, restorer-key-prefix). Order matters: env and ssl first.
+# Ports that strongly suggest the raw connection is carrying HTTP(S).
+_WEB_PORTS = {80, 443, 591, 3000, 4443, 5000, 8000, 8008, 8080, 8081, 8443, 8888, 9000, 9443}
+_WARNED_RAW = set()  # (host, port) already warned about, to warn once each
+
+
+def _patch_asyncio() -> bool:
+    """Hook asyncio's low-level ``create_connection``.
+
+    This is the only way to reach scripts that speak HTTP over a raw asyncio
+    socket (their own ``Protocol`` plus a sans-IO parser such as h11), since
+    they use no HTTP library. The hook is generic: it applies to any host/port,
+    with or without TLS, and to ``asyncio.open_connection`` too (which calls
+    ``create_connection`` underneath).
+
+    Two modes:
+      * active (``raw_sockets=True``): tunnel each outbound connection through
+        the proxy with an HTTP CONNECT.
+      * passive (default): change nothing, but if a direct connection that
+        looks like HTTP(S) slips past ulak, warn once and tell the user to
+        re-run with ``raw_sockets=True``.
+    """
+    import socket as _socket
+    import ssl as _sslmod
+    from asyncio import base_events
+
+    proxy_host = str(_STATE["host"])
+    proxy_port = int(_STATE["port"])  # type: ignore[arg-type]
+    verify = _STATE["verify"]
+    active = _RAW_SOCKETS
+
+    _ORIG.setdefault("asyncio.create_connection",
+                     base_events.BaseEventLoop.create_connection)
+    orig = _ORIG["asyncio.create_connection"]
+
+    def _is_proxy_dest(host, port):
+        try:
+            return host is not None and str(host) == proxy_host and int(port or 0) == proxy_port
+        except (TypeError, ValueError):
+            return False
+
+    def _looks_web(ssl_arg, port):
+        if ssl_arg:
+            return True
+        try:
+            return int(port or 0) in _WEB_PORTS
+        except (TypeError, ValueError):
+            return False
+
+    def _connect_and_tunnel(target_host, target_port):
+        sock = _socket.create_connection((proxy_host, proxy_port), timeout=30)
+        try:
+            tgt = f"{target_host}:{target_port}".encode("latin-1")
+            sock.sendall(b"CONNECT " + tgt + b" HTTP/1.1\r\nHost: " + tgt + b"\r\n\r\n")
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    raise OSError("proxy closed the connection during CONNECT")
+                buf += chunk
+                if len(buf) > 65536:
+                    raise OSError("CONNECT response header too large")
+            status_line = buf.split(b"\r\n", 1)[0]
+            if b" 200" not in status_line:
+                raise OSError("proxy refused CONNECT: "
+                              + status_line.decode("latin-1", "replace"))
+        except Exception:
+            sock.close()
+            raise
+        sock.setblocking(False)
+        return sock
+
+    async def create_connection(self, protocol_factory, host=None, port=None, *,
+                                ssl=None, server_hostname=None,
+                                ssl_handshake_timeout=None, **kwargs):
+        passthrough = host is None or _is_proxy_dest(host, port)
+
+        # Active mode: tunnel real HTTP(S) destinations through the proxy.
+        if active and not passthrough:
+            if ssl and verify is False and isinstance(ssl, _sslmod.SSLContext):
+                ssl.check_hostname = False
+                ssl.verify_mode = _sslmod.CERT_NONE
+            sock = await self.run_in_executor(None, _connect_and_tunnel, host, port)
+            # These are only valid alongside host/port, not with sock=.
+            for key in ("happy_eyeballs_delay", "local_addr", "family",
+                        "proto", "flags", "all_errors"):
+                kwargs.pop(key, None)
+            if ssl and server_hostname is None:
+                server_hostname = str(host)
+            return await orig(self, protocol_factory, sock=sock, ssl=ssl,
+                              server_hostname=server_hostname,
+                              ssl_handshake_timeout=ssl_handshake_timeout, **kwargs)
+
+        # Passive mode: observe only, warn once about missed HTTP(S) traffic.
+        if not active and not passthrough:
+            try:
+                if _looks_web(ssl, port):
+                    key = (str(host), int(port or 0))
+                    if key not in _WARNED_RAW:
+                        _WARNED_RAW.add(key)
+                        print(f"[ulak] WARNING: a direct connection to {host}:{port} "
+                              "is NOT going through the proxy. This looks like "
+                              "raw-socket HTTP(S) (no HTTP library involved). "
+                              "Re-run with ulak.proxy(..., raw_sockets=True) to capture it.",
+                              file=sys.stderr)
+            except Exception:
+                pass
+
+        return await orig(self, protocol_factory, host, port, ssl=ssl,
+                          server_hostname=server_hostname,
+                          ssl_handshake_timeout=ssl_handshake_timeout, **kwargs)
+
+    base_events.BaseEventLoop.create_connection = create_connection
+    return True
+
+
+# (name, patcher). Order matters: env and ssl first.
 _PATCHERS: List[tuple] = [
     ("env", _patch_env),
     ("ssl", _patch_ssl),
@@ -422,6 +538,7 @@ _PATCHERS: List[tuple] = [
     ("httplib2", _patch_httplib2),
     ("curl_cffi", _patch_curl_cffi),
     ("tornado", _patch_tornado),
+    ("asyncio", _patch_asyncio),
 ]
 
 
@@ -481,6 +598,10 @@ def _restore_all() -> None:
         prior = _ORIG.pop("tornado.impl")
         thc.AsyncHTTPClient.configure(prior)
 
+    if "asyncio.create_connection" in _ORIG:
+        from asyncio import base_events
+        base_events.BaseEventLoop.create_connection = _ORIG.pop("asyncio.create_connection")
+
     _restore_env()
 
 
@@ -493,6 +614,7 @@ def proxy(host: str = "127.0.0.1",
           *,
           verify: Verify = False,
           scheme: str = "http",
+          raw_sockets: bool = False,
           verbose: bool = True) -> Dict[str, object]:
     """Route all outbound HTTP/HTTPS traffic of this process through a proxy.
 
@@ -509,17 +631,25 @@ def proxy(host: str = "127.0.0.1",
     scheme:
         Proxy scheme, ``"http"`` by default (Burp/ZAP/mitmproxy are HTTP
         proxies).
+    raw_sockets:
+        When True, also hook asyncio's low-level ``create_connection`` so that
+        scripts speaking HTTP over a raw asyncio socket (their own protocol
+        plus a sans-IO parser such as h11) are tunneled through the proxy with
+        an HTTP CONNECT. Off by default, because it reroutes every asyncio TCP
+        connection in the process.
     verbose:
         Print a one-line activation banner to stderr.
 
     Calling this again re-applies with the new settings (the previous hook is
     reverted first). Returns a status dict describing what was patched.
     """
-    global _VERBOSE
+    global _VERBOSE, _RAW_SOCKETS
     _VERBOSE = verbose
+    _RAW_SOCKETS = raw_sockets
 
     if _STATE["active"]:
         off()
+        _RAW_SOCKETS = raw_sockets  # off() reset it; restore our choice
 
     proxy_url = f"{scheme}://{host}:{port}"
     _STATE.update({
@@ -546,8 +676,15 @@ def proxy(host: str = "127.0.0.1",
             _STATE["errors"][name] = repr(exc)   # type: ignore[index]
             logger.exception("ulak: patching %s failed", name)
 
+    hooked = [p for p in _STATE["patched"] if p not in ("env", "ssl", "asyncio")]  # type: ignore[union-attr]
     _banner(f"routing HTTP/HTTPS through {proxy_url} (verify={verify!r})")
-    _banner("patched: " + ", ".join(_STATE["patched"]))  # type: ignore[arg-type]
+    _banner("hooked HTTP libraries present in this process: " + (", ".join(hooked) or "none"))
+    if "asyncio" in _STATE["patched"]:  # type: ignore[operator]
+        if raw_sockets:
+            _banner("asyncio raw sockets: tunneling through the proxy (CONNECT).")
+        else:
+            _banner("asyncio raw sockets: detect-only; if a direct HTTP(S) connection "
+                    "is seen you will be told to re-run with raw_sockets=True.")
     if _STATE["unsupported"]:
         for lib, reason in _STATE["unsupported"].items():  # type: ignore[attr-defined]
             _banner(f"note: {lib} not proxied ({reason})")
@@ -560,11 +697,15 @@ def proxy(host: str = "127.0.0.1",
 
 def off() -> None:
     """Revert every patch and restore the original environment variables."""
+    global _RAW_SOCKETS
     if not _STATE["active"]:
+        _RAW_SOCKETS = False
         return
     try:
         _restore_all()
     finally:
+        _RAW_SOCKETS = False
+        _WARNED_RAW.clear()
         _banner("proxy disabled; all hooks reverted.")
         _STATE.update({
             "active": False, "host": None, "port": None, "url": None,

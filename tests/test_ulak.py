@@ -230,6 +230,100 @@ def test_context_manager(proxy_server):
     assert os.environ.get("HTTP_PROXY") is None
 
 
+def test_raw_asyncio_socket_is_tunneled(proxy_server):
+    """A script using loop.create_connection directly (no HTTP library) is
+    only covered when raw_sockets=True."""
+    import ssl as _ssl
+
+    class _P(asyncio.Protocol):
+        def __init__(self):
+            self.data = bytearray()
+            self.done = asyncio.get_event_loop().create_future()
+            self.transport = None
+
+        def connection_made(self, t):
+            self.transport = t
+
+        def data_received(self, d):
+            self.data += d
+
+        def connection_lost(self, exc):
+            if not self.done.done():
+                self.done.set_result(True)
+
+    async def fetch():
+        ctx = _ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = _ssl.CERT_NONE
+        loop = asyncio.get_running_loop()
+        transport, proto = await loop.create_connection(
+            _P, host="example.com", port=443,
+            ssl=ctx, server_hostname="example.com", happy_eyeballs_delay=0.25,
+        )
+        transport.write(b"GET / HTTP/1.1\r\nHost: example.com\r\n"
+                        b"Connection: close\r\nAccept-Encoding: identity\r\n\r\n")
+        try:
+            await asyncio.wait_for(proto.done, timeout=20)
+        except asyncio.TimeoutError:
+            pass
+        transport.close()
+        return bytes(proto.data)
+
+    ulak.proxy(proxy_server.host, proxy_server.port, verify=False,
+               raw_sockets=True, verbose=False)
+    try:
+        data = asyncio.run(fetch())
+    finally:
+        ulak.off()
+
+    assert data.split(b"\r\n", 1)[0].startswith(b"HTTP/")
+    assert any(m == "CONNECT" and "example.com:443" in t for m, t in proxy_server.seen)
+
+
+def test_raw_socket_detection_warns_when_off(proxy_server, capsys):
+    """With raw_sockets off, a direct HTTP(S)-looking asyncio connection is not
+    rerouted, but ulak warns once and points at raw_sockets=True."""
+    import ssl as _ssl
+
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    dest_host, dest_port = srv.getsockname()
+
+    class _P(asyncio.Protocol):
+        def connection_made(self, t):
+            t.close()
+
+        def connection_lost(self, exc):
+            pass
+
+    async def go():
+        ctx = _ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = _ssl.CERT_NONE
+        loop = asyncio.get_running_loop()
+        try:
+            transport, _ = await asyncio.wait_for(
+                loop.create_connection(_P, dest_host, dest_port,
+                                       ssl=ctx, server_hostname="x"),
+                timeout=5,
+            )
+            transport.close()
+        except Exception:
+            pass  # local server is not TLS; the handshake failing is fine
+
+    ulak.proxy(proxy_server.host, proxy_server.port, verify=False, verbose=False)
+    try:
+        asyncio.run(go())
+    finally:
+        ulak.off()
+        srv.close()
+
+    err = capsys.readouterr().err
+    assert "raw_sockets=True" in err          # the actionable warning fired
+    assert proxy_server.seen == []            # and it was not rerouted
+
+
 def test_status_reports_patched(proxy_server):
     st = ulak.proxy(proxy_server.host, proxy_server.port, verbose=False)
     try:
