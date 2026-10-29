@@ -1,0 +1,20 @@
+# Build artifacts
+dist/
+build/
+*.egg-info/
+src/*.egg-info/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg
+.pytest_cache/
+.tox/
+.venv/
+venv/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
